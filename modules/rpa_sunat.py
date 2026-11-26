@@ -201,3 +201,138 @@ class OpenRUCClient:
             resultados.append(resultado)
 
         return resultados
+
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+class DecolectaClient:
+    """
+    Cliente para obtener información empresarial extendida
+    mediante la API de Decolecta.
+    """
+
+    API_URL = "https://api.decolecta.com/v1/sunat/ruc/full"
+
+    def __init__(self, api_key=None, timeout=15):
+        self.api_key = api_key or os.getenv("DECOLECTA_API_KEY")
+        self.timeout = timeout
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.api_key or ''}",
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+        })
+
+    def consultar_ruc_completo(self, ruc):
+        ruc = str(ruc).strip()
+
+        if not validar_ruc(ruc):
+            return {
+                "ruc": ruc,
+                "consulta_exitosa": False,
+                "error": "RUC inválido"
+            }
+
+        if not self.api_key:
+            return {
+                "ruc": ruc,
+                "consulta_exitosa": False,
+                "error": "DECOLECTA_API_KEY no configurada"
+            }
+
+        try:
+            response = self.session.get(
+                self.API_URL,
+                params={"numero": ruc},
+                timeout=self.timeout
+            )
+
+            if response.status_code == 404:
+                return {
+                    "ruc": ruc,
+                    "consulta_exitosa": False,
+                    "error": "RUC no encontrado en Decolecta"
+                }
+
+            if response.status_code in (401, 403):
+                return {
+                    "ruc": ruc,
+                    "consulta_exitosa": False,
+                    "error": "Token inválido o acceso no autorizado"
+                }
+
+            if response.status_code == 429:
+                return {
+                    "ruc": ruc,
+                    "consulta_exitosa": False,
+                    "error": "Cuota o límite de consultas alcanzado"
+                }
+
+            response.raise_for_status()
+
+            datos = response.json()
+
+            if not isinstance(datos, dict):
+                raise ValueError("Respuesta JSON inválida")
+
+            actividad = datos.get("actividad_economica")
+
+            # Normalizar el perfil empresarial.
+            return {
+                "ruc": str(
+                    datos.get("numero_documento")
+                    or datos.get("ruc")
+                    or ruc
+                ),
+                "razon_social": datos.get("razon_social"),
+                "estado": datos.get("estado"),
+                "condicion": datos.get("condicion"),
+                "direccion": (
+                    datos.get("direccion")
+                    or datos.get("dirección")
+                ),
+                "tipo_contribuyente": datos.get("tipo"),
+                "actividad_economica": actividad,
+                "numero_trabajadores": datos.get(
+                    "numero_trabajadores"
+                ),
+                "tipo_facturacion": datos.get(
+                    "tipo_facturacion"
+                ),
+                "tipo_contabilidad": datos.get(
+                    "tipo_contabilidad"
+                ),
+                "comercio_exterior": datos.get(
+                    "comercio_exterior"
+                ),
+                "consulta_exitosa": True,
+                "fuente_actividad_economica": (
+                    "Decolecta" if actividad else None
+                )
+            }
+
+        except requests.Timeout:
+            return {
+                "ruc": ruc,
+                "consulta_exitosa": False,
+                "error": "Tiempo de espera agotado en Decolecta"
+            }
+
+        except requests.RequestException as error:
+            return {
+                "ruc": ruc,
+                "consulta_exitosa": False,
+                "error": f"Error de conexión con Decolecta: {error}"
+            }
+
+        except ValueError as error:
+            return {
+                "ruc": ruc,
+                "consulta_exitosa": False,
+                "error": f"Respuesta inválida de Decolecta: {error}"
+            }

@@ -110,3 +110,99 @@ def test_api_key_no_configurada(monkeypatch):
 
     with pytest.raises(ValueError, match="GEMINI_API_KEY"):
         AuditorIA()
+
+import modules.ia_auditor as modulo_ia
+
+
+class ErrorAPIFicticio(Exception):
+    def __init__(self, code):
+        self.code = code
+        super().__init__(f"Error API {code}")
+
+
+def test_gemini_reintenta_despues_de_error_503(
+    proveedor,
+    respuesta_valida,
+    monkeypatch
+):
+    monkeypatch.setattr(
+        modulo_ia.errors,
+        "APIError",
+        ErrorAPIFicticio
+    )
+
+    monkeypatch.setattr(
+        modulo_ia.time,
+        "sleep",
+        lambda segundos: None
+    )
+
+    auditor, cliente = crear_auditor(
+        json.dumps(respuesta_valida)
+    )
+
+    cliente.models.generate_content.side_effect = [
+        ErrorAPIFicticio(503),
+        ErrorAPIFicticio(503),
+        MagicMock(text=json.dumps(respuesta_valida))
+    ]
+
+    resultado = auditor.evaluar_proveedor(proveedor)
+
+    assert resultado == respuesta_valida
+    assert cliente.models.generate_content.call_count == 3
+
+
+def test_gemini_falla_despues_de_tres_errores_503(
+    proveedor,
+    monkeypatch
+):
+    monkeypatch.setattr(
+        modulo_ia.errors,
+        "APIError",
+        ErrorAPIFicticio
+    )
+
+    monkeypatch.setattr(
+        modulo_ia.time,
+        "sleep",
+        lambda segundos: None
+    )
+
+    auditor, cliente = crear_auditor()
+
+    cliente.models.generate_content.side_effect = [
+        ErrorAPIFicticio(503),
+        ErrorAPIFicticio(503),
+        ErrorAPIFicticio(503)
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match="sobrecargado después de 3 intentos"
+    ):
+        auditor.evaluar_proveedor(proveedor)
+
+    assert cliente.models.generate_content.call_count == 3
+
+
+def test_gemini_no_reintenta_error_429(
+    proveedor,
+    monkeypatch
+):
+    monkeypatch.setattr(
+        modulo_ia.errors,
+        "APIError",
+        ErrorAPIFicticio
+    )
+
+    auditor, cliente = crear_auditor()
+
+    cliente.models.generate_content.side_effect = (
+        ErrorAPIFicticio(429)
+    )
+
+    with pytest.raises(RuntimeError):
+        auditor.evaluar_proveedor(proveedor)
+
+    assert cliente.models.generate_content.call_count == 1

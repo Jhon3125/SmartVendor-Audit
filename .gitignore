@@ -3,3 +3,10 @@ venv/
 __pycache__/
 .pytest_cache/
 *.pyc
+
+# Caché local de consultas empresariales
+data/cache_proveedores.json
+data/cache_rucs.json
+
+# Archivos locales de prueba
+data/prueba_proveedores.xlsx

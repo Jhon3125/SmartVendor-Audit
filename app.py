@@ -3,11 +3,40 @@ import pandas as pd
 from io import BytesIO
 from datetime import datetime
 
+import os
+import json
+
 from modules.provider_service import ProviderService
 from modules.ia_auditor import AuditorIA
 from modules.risk_engine import generar_dictamen
 from modules.excel_handler import cargar_proveedores
 
+from database.repositories.proveedor_repository import (
+    guardar_o_actualizar,
+)
+from database.repositories.cotizacion_repository import (
+    guardar as guardar_cotizacion,
+)
+from database.repositories.auditoria_repository import (
+    crear_auditoria,
+    crear_evaluacion_ia,
+    guardar_resultado_ia,
+    registrar_error_ia,
+    registrar_intento_gemini,
+    finalizar_intento_gemini,
+    actualizar_dictamen,
+    listar_auditorias,
+    obtener_auditoria,
+    listar_evaluaciones,
+    listar_intentos,
+    listar_historial,
+)
+
+from database.repositories.lote_repository import (
+    crear_lote,
+    actualizar_estado_lote,
+    guardar_registro_lote,
+)
 
 # ============================================================
 # CONFIGURACIÓN GENERAL
@@ -368,6 +397,9 @@ if "ultimo_resultado" not in st.session_state:
 if "nav_pagina" not in st.session_state:
     st.session_state.nav_pagina = "Dashboard"
 
+if "perfiles_auditoria_masiva" not in st.session_state:
+    st.session_state.perfiles_auditoria_masiva = {}
+
 
 # ============================================================
 # FUNCIONES AUXILIARES
@@ -489,6 +521,92 @@ def ir_a_nueva_auditoria():
 def ir_a_historial():
     st.session_state.nav_pagina = "Historial"
 
+def normalizar_valor_excel(valor):
+    """Convierte valores de pandas y NumPy a datos compatibles con JSON."""
+
+    if isinstance(valor, dict):
+        return {
+            clave: normalizar_valor_excel(dato)
+            for clave, dato in valor.items()
+        }
+
+    if isinstance(valor, (list, tuple)):
+        return [
+            normalizar_valor_excel(dato)
+            for dato in valor
+        ]
+
+    # Convierte arreglos NumPy sin evaluarlos como booleanos.
+    if hasattr(valor, "tolist") and not pd.api.types.is_scalar(valor):
+        return normalizar_valor_excel(valor.tolist())
+
+    # Solo comprobar valores nulos cuando son escalares.
+    if pd.api.types.is_scalar(valor) and pd.isna(valor):
+        return None
+
+    return valor
+
+def convertir_json(valor, valor_predeterminado=None):
+    """Convierte una cadena JSON a Python sin interrumpir la interfaz."""
+
+    if valor_predeterminado is None:
+        valor_predeterminado = {}
+
+    if valor is None:
+        return valor_predeterminado
+
+    if isinstance(valor, (dict, list)):
+        return valor
+
+    if isinstance(valor, str):
+        try:
+            return json.loads(valor)
+        except (json.JSONDecodeError, TypeError):
+            return valor_predeterminado
+
+    return valor_predeterminado
+
+def obtener_historial_desde_db():
+    """Obtiene y adapta las auditorías almacenadas en MySQL."""
+
+    auditorias = listar_auditorias()
+    historial = []
+
+    for auditoria in auditorias:
+        fecha = (
+            auditoria.get("actualizada_en")
+            or auditoria.get("creada_en")
+        )
+
+        if fecha:
+            fecha = fecha.strftime("%d/%m/%Y %H:%M:%S")
+        else:
+            fecha = "Sin fecha"
+
+        historial.append({
+            "auditoria_id": auditoria.get("auditoria_id"),
+            "fecha": fecha,
+            "ruc": auditoria.get("ruc"),
+            "razon_social": auditoria.get("razon_social"),
+            "servicio": auditoria.get("servicio_cotizado"),
+            "monto": auditoria.get("monto"),
+            "moneda": auditoria.get("moneda"),
+            "dictamen": auditoria.get("dictamen"),
+            "nivel_riesgo": auditoria.get("nivel_riesgo"),
+            "puntaje_confianza": auditoria.get("puntaje_confianza", 0),
+            "estado": auditoria.get("estado"),
+            "lote_id": auditoria.get("lote_id"),
+            "coherencia_comercial": auditoria.get(
+                "coherencia_comercial"
+            ),
+            "riesgo_ia": auditoria.get("riesgo_ia"),
+            "recomendacion": auditoria.get("recomendacion"),
+            "estado_gemini": auditoria.get("estado_gemini"),
+            "motivo": auditoria.get("motivo"),
+        })
+
+    return historial
+
 
 # ============================================================
 # SIDEBAR / NAVEGACIÓN
@@ -547,6 +665,7 @@ except Exception as error:
     error_servicios = str(error)
 
 
+
 # ============================================================
 # DASHBOARD
 # ============================================================
@@ -559,82 +678,290 @@ if pagina_actual == "Dashboard":
         "VISTA GENERAL",
     )
 
-    historial = st.session_state.historial
+    # --------------------------------------------------------
+    # CONSULTAR INFORMACIÓN DESDE MYSQL
+    # --------------------------------------------------------
+
+    try:
+        historial = obtener_historial_desde_db()
+    except Exception as error:
+        st.error(f"No se pudo recuperar el Dashboard desde MySQL: {error}")
+        historial = []
+
     df = pd.DataFrame(historial) if historial else pd.DataFrame()
 
-    total = len(historial)
-    aprobados = (
-        int((df["dictamen"] == "APROBADO").sum()) if total else 0
-    )
-    observados = (
-        int((df["dictamen"] == "OBSERVADO").sum()) if total else 0
-    )
-    rechazados = (
-        int((df["dictamen"] == "RECHAZADO").sum()) if total else 0
-    )
-    pendientes = (
-        int((df["dictamen"] == "PENDIENTE_VALIDACION").sum()) if total else 0
+    total = len(df)
+
+    if total:
+        aprobados = int((df["dictamen"] == "APROBADO").sum())
+        observados = int((df["dictamen"] == "OBSERVADO").sum())
+        rechazados = int((df["dictamen"] == "RECHAZADO").sum())
+        pendientes = int(
+            (df["dictamen"] == "PENDIENTE_VALIDACION").sum()
+        )
+    else:
+        aprobados = observados = rechazados = pendientes = 0
+
+    porcentaje_aprobados = (
+        round((aprobados / total) * 100) if total else 0
     )
 
+    # --------------------------------------------------------
+    # INDICADORES PRINCIPALES
+    # --------------------------------------------------------
+
     st.markdown("#### Indicadores principales")
+
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        tarjeta_resumen("Auditorías realizadas", total, "Registros en esta sesión", "▦")
+        with st.container(border=True):
+            st.caption("▦ AUDITORÍAS REALIZADAS")
+            st.metric("Total de auditorías", total)
+            st.caption("Registros almacenados en MySQL")
+
     with c2:
-        tarjeta_resumen("Proveedores aprobados", aprobados, "Dictamen favorable", "✓")
+        with st.container(border=True):
+            st.caption("✓ APROBADOS")
+            st.metric("Proveedores aprobados", aprobados)
+            st.caption(f"{porcentaje_aprobados}% del total")
+
     with c3:
-        tarjeta_resumen("Proveedores observados", observados, "Requieren revisión", "!")
+        with st.container(border=True):
+            st.caption("! OBSERVADOS")
+            st.metric("Requieren revisión", observados)
+            st.caption("Necesitan evaluación adicional")
+
     with c4:
-        tarjeta_resumen("Proveedores rechazados", rechazados, "Riesgo no aceptable", "×")
+        with st.container(border=True):
+            st.caption("× RECHAZADOS")
+            st.metric("Riesgo no aceptable", rechazados)
+            st.caption("No cumplen los criterios")
+
+    # --------------------------------------------------------
+    # DISTRIBUCIÓN Y ACTIVIDAD RECIENTE
+    # --------------------------------------------------------
 
     st.markdown("")
-    izquierda, derecha = st.columns([1.15, 1])
+
+    izquierda, derecha = st.columns([1, 1.05], gap="large")
+
+    # --------------------------------------------------------
+    # DISTRIBUCIÓN DE DICTÁMENES
+    # --------------------------------------------------------
 
     with izquierda:
-        st.markdown(
-            '<div class="sv-section-title">Distribución de dictámenes</div>'
-            '<div class="sv-section-caption">Resultados de las auditorías de esta sesión</div>',
-            unsafe_allow_html=True,
-        )
+
+        st.markdown("#### Distribución de dictámenes")
+        st.caption("Cantidad de auditorías por resultado · Datos de MySQL")
+
+        categorias = [
+            ("Aprobados", aprobados, "#36C995"),
+            ("Observados", observados, "#EAB85C"),
+            ("Pendientes", pendientes, "#65B9F3"),
+            ("Rechazados", rechazados, "#E77C8C"),
+        ]
 
         if total:
-            conteo = pd.DataFrame(
-                {
-                    "Dictamen": ["Aprobados", "Observados", "Rechazados", "Pendientes"],
-                    "Cantidad": [aprobados, observados, rechazados, pendientes],
-                }
-            )
-            st.bar_chart(conteo.set_index("Dictamen"), height=250)
-        else:
-            st.info("Cuando ejecutes auditorías, aquí aparecerá la distribución de dictámenes.")
 
-    with derecha:
-        st.markdown(
-            '<div class="sv-section-title">Actividad reciente</div>'
-            '<div class="sv-section-caption">Últimas auditorías registradas</div>',
-            unsafe_allow_html=True,
-        )
+            for nombre, cantidad, color in categorias:
 
-        if total:
-            recientes = df.tail(5).iloc[::-1]
-            for _, fila in recientes.iterrows():
+                porcentaje = round((cantidad / total) * 100)
+
                 st.markdown(
                     f"""
-                    <div class="sv-panel" style="padding:13px 15px; margin-bottom:9px;">
-                        <div style="display:flex; justify-content:space-between; gap:10px;">
-                            <b style="color:#edf4ff;">{fila.get('razon_social') or 'Proveedor sin nombre'}</b>
-                            <span class="sv-pill">{fila.get('dictamen', 'N/D')}</span>
-                        </div>
-                        <div class="sv-muted" style="margin-top:6px;">
-                            RUC {fila.get('ruc', '')} · {fila.get('fecha', '')}
-                        </div>
+                    <div style="
+                        display:flex;
+                        justify-content:space-between;
+                        align-items:center;
+                        margin-top:14px;
+                        margin-bottom:5px;
+                    ">
+                        <span style="color:#D8E3F0;font-size:14px;">
+                            {nombre}
+                        </span>
+                        <span style="
+                            color:#FFFFFF;
+                            font-weight:600;
+                            font-size:14px;
+                        ">
+                            {cantidad} · {porcentaje}%
+                        </span>
                     </div>
                     """,
                     unsafe_allow_html=True,
                 )
+
+                st.progress(porcentaje / 100)
+
+            with st.container(border=True):
+                st.markdown("Total de auditorías: " + str(total))
+                st.caption(
+                    f"Porcentaje de aprobación: {porcentaje_aprobados}%"
+                )
+
+        else:
+            st.info("Todavía no hay auditorías registradas.")
+
+    # --------------------------------------------------------
+    # ACTIVIDAD RECIENTE
+    # --------------------------------------------------------
+
+    with derecha:
+
+        st.markdown("#### Actividad reciente")
+        st.caption("Las últimas cinco auditorías registradas")
+
+
+        if total:
+
+            # Paginación: 3 auditorías por página
+            registros_por_pagina = 3
+
+            if "pagina_actividad" not in st.session_state:
+                st.session_state.pagina_actividad = 0
+
+            total_paginas = max(
+                1,
+                (total + registros_por_pagina - 1)
+                // registros_por_pagina
+            )
+
+            # Evitar páginas fuera del rango disponible
+            st.session_state.pagina_actividad = min(
+                st.session_state.pagina_actividad,
+                total_paginas - 1
+            )
+
+            pagina = st.session_state.pagina_actividad
+
+            inicio = pagina * registros_por_pagina
+            fin = inicio + registros_por_pagina
+
+            recientes = df.iloc[inicio:fin]
+
+            for _, fila in recientes.iterrows():
+
+                dictamen = fila.get("dictamen") or "N/D"
+                proveedor = fila.get("razon_social") or "Proveedor sin nombre"
+                servicio = fila.get("servicio") or "Servicio no especificado"
+                ruc = fila.get("ruc") or "Sin RUC"
+                fecha = fila.get("fecha") or "Sin fecha"
+
+                try:
+                    monto = float(fila.get("monto") or 0)
+                    moneda = fila.get("moneda") or "PEN"
+                    monto_texto = f"{moneda} {monto:,.2f}"
+                except (ValueError, TypeError):
+                    monto_texto = "Monto no disponible"
+
+                colores = {
+                    "APROBADO": ("#123D32", "#43D6A0"),
+                    "OBSERVADO": ("#49391D", "#EAB85C"),
+                    "RECHAZADO": ("#48232C", "#E77C8C"),
+                    "PENDIENTE_VALIDACION": ("#183653", "#65B9F3"),
+                }
+
+                fondo, texto = colores.get(
+                    dictamen,
+                    ("#263448", "#B8C9DC")
+                )
+
+                with st.container(border=True):
+
+                    encabezado, estado = st.columns([3, 1.3])
+
+                    with encabezado:
+                        st.markdown(f"**{proveedor}**")
+
+                    with estado:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                background:{fondo};
+                                color:{texto};
+                                padding:5px 8px;
+                                border-radius:20px;
+                                text-align:center;
+                                font-size:10px;
+                                font-weight:700;
+                            ">
+                                {dictamen}
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                    st.markdown(
+                        f"""
+                        <div style="color:#A9BDD3;font-size:12px;">
+                            {servicio}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    dato1, dato2 = st.columns(2)
+
+                    with dato1:
+                        st.caption(f"RUC: {ruc}")
+
+                    with dato2:
+                        st.caption(monto_texto)
+
+                    st.caption(f"Fecha: {fecha}")
+
+            # Controles de paginación
+            st.markdown("")
+
+            anterior, indicador, siguiente = st.columns([1, 2, 1])
+
+            with anterior:
+                if st.button(
+                    "← Anterior",
+                    disabled=(pagina == 0),
+                    use_container_width=True,
+                    key="actividad_anterior",
+                ):
+                    st.session_state.pagina_actividad -= 1
+                    st.rerun()
+
+            with indicador:
+                st.markdown(
+                    f"""
+                    <div style="
+                        text-align:center;
+                        padding:8px;
+                        color:#A9BDD3;
+                        font-size:13px;
+                    ">
+                        Página {pagina + 1} de {total_paginas}
+                        <br>
+                        <span style="font-size:11px;">
+                            {total} auditorías registradas
+                        </span>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with siguiente:
+                if st.button(
+                    "Siguiente →",
+                    disabled=(pagina >= total_paginas - 1),
+                    use_container_width=True,
+                    key="actividad_siguiente",
+                ):
+                    st.session_state.pagina_actividad += 1
+                    st.rerun()
+
         else:
             st.info("Aún no hay actividad registrada.")
+
+
+    # --------------------------------------------------------
+    # ACCESOS RÁPIDOS
+    # --------------------------------------------------------
 
     st.markdown("---")
     st.markdown("#### Acceso rápido")
@@ -643,14 +970,14 @@ if pagina_actual == "Dashboard":
 
     with q1:
         st.button(
-            "＋  Iniciar nueva auditoría",
+            "＋ Iniciar nueva auditoría",
             use_container_width=True,
             on_click=ir_a_nueva_auditoria,
         )
 
     with q2:
         st.button(
-            "▤  Consultar historial",
+            "▤ Consultar historial",
             use_container_width=True,
             on_click=ir_a_historial,
         )
@@ -746,6 +1073,7 @@ elif pagina_actual == "Nueva auditoría":
             use_container_width=True,
         )
 
+
     if ejecutar:
         ruc = ruc.strip()
 
@@ -755,8 +1083,13 @@ elif pagina_actual == "Nueva auditoría":
             st.error("Ingresa el servicio o producto cotizado.")
         else:
             try:
-                with st.status("Ejecutando auditoría del proveedor...", expanded=True) as estado:
-                    st.write("**1 de 3 · Consulta empresarial**")
+                with st.status(
+                    "Ejecutando auditoría del proveedor...",
+                    expanded=True,
+                ) as estado:
+                    # 1. Consulta de información empresarial
+                    st.write("**1 de 4 · Consulta empresarial**")
+
                     perfil = provider_service.consultar_proveedor(
                         ruc,
                         forzar_consulta=forzar_consulta,
@@ -776,17 +1109,104 @@ elif pagina_actual == "Nueva auditoría":
                     perfil["monto"] = monto
                     perfil["moneda"] = moneda
 
-                    st.write("Información empresarial obtenida.")
+                    # 2. Persistencia inicial en MySQL
+                    st.write("**2 de 4 · Registro en la base de datos**")
 
-                    st.write("**2 de 3 · Evaluación con inteligencia artificial**")
-                    evaluacion = auditor_ia.evaluar_proveedor(perfil)
-                    st.write("Evaluación de Gemini completada.")
+                    proveedor_db = guardar_o_actualizar(perfil)
 
-                    st.write("**3 de 3 · Generación del dictamen**")
+                    cotizacion_id = guardar_cotizacion(
+                        proveedor_id=proveedor_db["id"],
+                        servicio_cotizado=servicio.strip(),
+                        monto=monto,
+                        moneda=moneda,
+                    )
+
+                    auditoria_id = crear_auditoria(cotizacion_id)
+
+                    modelo_gemini = os.getenv(
+                        "GEMINI_MODEL",
+                        "gemini-4-hydrogen",
+                    )
+
+                    evaluacion_id = crear_evaluacion_ia(
+                        auditoria_id,
+                        modelo_gemini,
+                    )
+
+                    st.write(
+                        f"Registro creado. Auditoría N.º {auditoria_id}."
+                    )
+
+                    # 3. Evaluación de Gemini y trazabilidad del intento
+                    st.write("**3 de 4 · Evaluación con Gemini**")
+
+                    intento_id = registrar_intento_gemini(
+                        evaluacion_id=evaluacion_id,
+                        numero_intento=1,
+                        estado="EN_PROCESO",
+                    )
+
+                    try:
+                        evaluacion = auditor_ia.evaluar_proveedor(perfil)
+
+                    except Exception as error_gemini:
+                        finalizar_intento_gemini(
+                            intento_id=intento_id,
+                            estado="ERROR",
+                            codigo_error="GEMINI_ERROR",
+                            detalle_error=str(error_gemini),
+                        )
+
+                        registrar_error_ia(
+                            evaluacion_id,
+                            str(error_gemini),
+                        )
+
+                        raise
+
+                    finalizar_intento_gemini(
+                        intento_id=intento_id,
+                        estado="EXITOSO",
+                    )
+
+                    if hasattr(evaluacion, "model_dump"):
+                        evaluacion_db = evaluacion.model_dump()
+                    elif hasattr(evaluacion, "dict"):
+                        evaluacion_db = evaluacion.dict()
+                    else:
+                        evaluacion_db = evaluacion
+
+                    guardar_resultado_ia(
+                        evaluacion_id,
+                        evaluacion_db,
+                    )
+
+                    # 4. Generación y persistencia del dictamen
+                    st.write("**4 de 4 · Generación del dictamen**")
+
                     dictamen = generar_dictamen(perfil, evaluacion)
 
+                    actualizar_dictamen(
+                        auditoria_id=auditoria_id,
+                        dictamen=dictamen.get("dictamen"),
+                        nivel_riesgo=(
+                            str(dictamen.get("nivel_riesgo", "No determinado"))
+                            .upper()
+                        ),
+                        puntaje_confianza=int(
+                            dictamen.get("puntaje_confianza", 0)
+                        ),
+                        motivo=(
+                            dictamen.get("motivo")
+                            or dictamen.get("justificacion")
+                            or evaluacion_db.get("justificacion")
+                        ),
+                        observacion="Auditoría individual registrada desde SmartVendor Audit.",
+                        accion="EVALUACION",
+                    )
+
                     estado.update(
-                        label="Auditoría finalizada correctamente",
+                        label="Auditoría guardada correctamente en MySQL",
                         state="complete",
                         expanded=False,
                     )
@@ -796,6 +1216,7 @@ elif pagina_actual == "Nueva auditoría":
                     "perfil": perfil,
                     "evaluacion": evaluacion,
                     "dictamen": dictamen,
+                    "auditoria_id": auditoria_id,
                 }
 
                 st.session_state.ultimo_resultado = resultado
@@ -810,14 +1231,19 @@ elif pagina_actual == "Nueva auditoría":
                         "moneda": moneda,
                         "dictamen": dictamen.get("dictamen"),
                         "nivel_riesgo": dictamen.get("nivel_riesgo"),
-                        "puntaje_confianza": dictamen.get("puntaje_confianza", 0),
+                        "puntaje_confianza": dictamen.get(
+                            "puntaje_confianza", 0
+                        ),
                     }
                 )
 
-                st.success("La auditoría se completó correctamente.")
+                st.success(
+                    f"Auditoría N.º {auditoria_id} completada y guardada en MySQL."
+                )
 
             except Exception as error:
                 st.error(f"No se pudo completar la auditoría: {error}")
+
 
     # --------------------------------------------------------
     # RESULTADO
@@ -1061,6 +1487,7 @@ elif pagina_actual == "Auditoría masiva":
                     "durante este lote. No se forzarán consultas externas."
                 )
 
+
                 if st.button(
                     "▶ Iniciar auditoría masiva",
                     type="primary",
@@ -1069,107 +1496,410 @@ elif pagina_actual == "Auditoría masiva":
                 ):
                     resultados_lote = []
                     perfiles_por_ruc = {}
+                    perfiles_por_registro = {}
+                    auditorias_por_registro = {}
+
+                    errores_lote = 0
                     barra = st.progress(0)
                     texto_progreso = st.empty()
 
-                    for posicion, (_, fila) in enumerate(df_validos.iterrows(), start=1):
-                        ruc_actual = str(fila["ruc"]).strip()
-                        servicio_actual = str(fila["servicio_cotizado"]).strip()
-                        monto_actual = float(fila["monto"])
-                        moneda_actual = str(fila["moneda"]).strip().upper()
+                    # 1. Crear el lote en MySQL
+                    lote_id = crear_lote(
+                        nombre_archivo=archivo.name,
+                        total_registros=total_filas,
+                        registros_validos=len(df_validos),
+                        registros_invalidos=len(df_invalidos),
+                    )
 
-                        texto_progreso.write(
-                            f"Procesando registro {posicion} de {len(df_validos)} · RUC {ruc_actual}"
-                        )
+                    actualizar_estado_lote(lote_id, "PROCESANDO")
 
-                        try:
-                            if ruc_actual not in perfiles_por_ruc:
-                                perfiles_por_ruc[ruc_actual] = provider_service.consultar_proveedor(
-                                    ruc_actual,
-                                    forzar_consulta=False,
+                    st.session_state["lote_auditoria_actual"] = lote_id
+
+                    try:
+                        # 2. Guardar todas las filas inválidas
+                        for _, fila_invalida in df_invalidos.iterrows():
+                            datos_originales = {
+                                campo: normalizar_valor_excel(valor)
+                                for campo, valor in fila_invalida.to_dict().items()
+                            }
+
+                            guardar_registro_lote(
+                                lote_id=lote_id,
+                                fila_excel=int(fila_invalida["fila_excel"]),
+                                datos_originales=datos_originales,
+                                estado_validacion="INVALIDO",
+                                errores_validacion=fila_invalida[
+                                    "errores_validacion"
+                                ],
+                            )
+
+                        # 3. Procesar los registros válidos
+                        for posicion, (_, fila) in enumerate(
+                            df_validos.iterrows(),
+                            start=1,
+                        ):
+                            ruc_actual = str(fila["ruc"]).strip()
+                            servicio_actual = str(
+                                fila["servicio_cotizado"]
+                            ).strip()
+                            monto_actual = float(fila["monto"])
+                            moneda_actual = str(
+                                fila["moneda"]
+                            ).strip().upper()
+                            fila_excel = int(fila["fila_excel"])
+
+                            clave_registro = (
+                                f"{fila_excel}|{ruc_actual}"
+                            )
+
+                            texto_progreso.write(
+                                f"Procesando registro {posicion} de "
+                                f"{len(df_validos)} · RUC {ruc_actual}"
+                            )
+
+                            auditoria_id = None
+                            evaluacion_id = None
+
+                            try:
+                                # Consultar datos tributarios una sola vez
+                                # por RUC durante el lote.
+                                if ruc_actual not in perfiles_por_ruc:
+                                    perfiles_por_ruc[ruc_actual] = (
+                                        provider_service.consultar_proveedor(
+                                            ruc_actual,
+                                            forzar_consulta=False,
+                                        )
+                                    )
+
+                                perfil = perfiles_por_ruc[ruc_actual].copy()
+
+                                perfil["ruc"] = ruc_actual
+                                perfil["servicio_cotizado"] = servicio_actual
+                                perfil["monto"] = monto_actual
+                                perfil["moneda"] = moneda_actual
+
+                                perfiles_por_registro[
+                                    clave_registro
+                                ] = perfil.copy()
+
+                                # Guardar proveedor y cotización
+                                proveedor_db = guardar_o_actualizar(perfil)
+
+                                cotizacion_id = guardar_cotizacion(
+                                    proveedor_id=proveedor_db["id"],
+                                    servicio_cotizado=servicio_actual,
+                                    monto=monto_actual,
+                                    moneda=moneda_actual,
+                                    lote_id=lote_id,
                                 )
 
-                            perfil = perfiles_por_ruc[ruc_actual].copy()
-                            perfil["servicio_cotizado"] = servicio_actual
-                            perfil["monto"] = monto_actual
-                            perfil["moneda"] = moneda_actual
+                                # Guardar la fila válida vinculada
+                                # a su cotización.
+                                guardar_registro_lote(
+                                    lote_id=lote_id,
+                                    fila_excel=fila_excel,
+                                    datos_originales={
+                                        campo: normalizar_valor_excel(valor)
+                                        for campo, valor in fila.to_dict().items()
+                                    },
+                                    estado_validacion="VALIDO",
+                                    cotizacion_id=cotizacion_id,
+                                )
 
-                            if not perfil.get("consulta_tributaria_exitosa"):
-                                evaluacion = {
-                                    "coherencia_comercial": "insufficient",
-                                    "nivel_riesgo": "high",
-                                    "puntaje_confianza": 0,
-                                    "justificacion": "No se pudo verificar la información tributaria del proveedor.",
-                                    "alertas": ["Consulta tributaria no exitosa."],
-                                    "recomendacion": "revisar",
+                                # Crear auditoría y evaluación inicial
+                                auditoria_id = crear_auditoria(
+                                    cotizacion_id
+                                )
+
+                                modelo_gemini = os.getenv(
+                                    "GEMINI_MODEL",
+                                    "gemini-4-hydrogen",
+                                )
+
+                                evaluacion_id = crear_evaluacion_ia(
+                                    auditoria_id,
+                                    modelo_gemini,
+                                )
+
+                                auditorias_por_registro[
+                                    clave_registro
+                                ] = {
+                                    "auditoria_id": auditoria_id,
+                                    "evaluacion_id": evaluacion_id,
                                 }
-                            else:
-                                evaluacion = auditor_ia.evaluar_proveedor(perfil)
 
-                            dictamen = generar_dictamen(perfil, evaluacion)
+                                # Si no hay verificación tributaria,
+                                # se conserva la auditoría pendiente.
+                                if not perfil.get(
+                                    "consulta_tributaria_exitosa"
+                                ):
+                                    errores = perfil.get(
+                                        "errores_fuentes", {}
+                                    )
 
-                            resultados_lote.append({
-                                "Fila Excel": int(fila["fila_excel"]),
-                                "RUC": ruc_actual,
-                                "Razón social": perfil.get("razon_social"),
-                                "Estado tributario": perfil.get("estado"),
-                                "Condición": perfil.get("condicion"),
-                                "Actividad económica": perfil.get("actividad_economica"),
-                                "Servicio cotizado": servicio_actual,
-                                "Monto": monto_actual,
-                                "Moneda": moneda_actual,
-                                "Coherencia comercial": evaluacion.get("coherencia_comercial"),
-                                "Riesgo IA": evaluacion.get("nivel_riesgo"),
-                                "Recomendación IA": evaluacion.get("recomendacion"),
-                                "Confianza IA": dictamen.get("puntaje_confianza", evaluacion.get("puntaje_confianza", 0)),
-                                "Dictamen final": dictamen.get("dictamen"),
-                                "Riesgo final": dictamen.get("nivel_riesgo"),
-                                "Motivo": dictamen.get("motivo"),
-                                "Alertas": " | ".join(dictamen.get("alertas", [])),
-                                "Error de proceso": "",
-                            })
+                                    detalle = " ".join(
+                                        str(v)
+                                        for v in errores.values()
+                                        if v
+                                    )
 
-                            st.session_state.historial.append({
-                                "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-                                "ruc": ruc_actual,
-                                "razon_social": perfil.get("razon_social"),
-                                "servicio": servicio_actual,
-                                "monto": monto_actual,
-                                "moneda": moneda_actual,
-                                "dictamen": dictamen.get("dictamen"),
-                                "nivel_riesgo": dictamen.get("nivel_riesgo"),
-                                "puntaje_confianza": dictamen.get("puntaje_confianza", 0),
-                            })
+                                    mensaje = (
+                                        "No se pudo verificar la "
+                                        "información tributaria. "
+                                        + detalle
+                                    )
 
-                        except Exception as error:
-                            resultados_lote.append({
-                                "Fila Excel": int(fila["fila_excel"]),
-                                "RUC": ruc_actual,
-                                "Razón social": "",
-                                "Estado tributario": "",
-                                "Condición": "",
-                                "Actividad económica": "",
-                                "Servicio cotizado": servicio_actual,
-                                "Monto": monto_actual,
-                                "Moneda": moneda_actual,
-                                "Coherencia comercial": "",
-                                "Riesgo IA": "No evaluado",
-                                "Recomendación IA": "Revisar",
-                                "Confianza IA": 0,
-                                "Dictamen final": "PENDIENTE_VALIDACION",
-                                "Riesgo final": "No determinado",
-                                "Motivo": "No se pudo completar la auditoría de este registro.",
-                                "Alertas": "",
-                                "Error de proceso": str(error),
-                            })
+                                    registrar_error_ia(
+                                        evaluacion_id,
+                                        mensaje,
+                                    )
 
-                        barra.progress(posicion / len(df_validos))
+                                    dictamen = {
+                                        "dictamen": "PENDIENTE_VALIDACION",
+                                        "nivel_riesgo": "No determinado",
+                                        "puntaje_confianza": 0,
+                                        "motivo": mensaje,
+                                        "alertas": [
+                                            "Consulta tributaria no exitosa."
+                                        ],
+                                    }
 
-                    st.session_state["resultados_auditoria_masiva"] = resultados_lote
-                    st.session_state["invalidos_auditoria_masiva"] = df_invalidos.to_dict("records")
-                    texto_progreso.success(
-                        f"Proceso finalizado: {len(resultados_lote)} registros procesados."
-                    )
+                                    evaluacion = {
+                                        "coherencia_comercial": "insuficiente",
+                                        "nivel_riesgo": "alto",
+                                        "puntaje_confianza": 0,
+                                        "justificacion": mensaje,
+                                        "alertas": [
+                                            "Consulta tributaria no exitosa."
+                                        ],
+                                        "recomendacion": "revisar",
+                                    }
+
+                                    errores_lote += 1
+
+                                else:
+                                    # Registrar el intento de Gemini
+                                    intento_id = registrar_intento_gemini(
+                                        evaluacion_id=evaluacion_id,
+                                        numero_intento=1,
+                                        estado="EN_PROCESO",
+                                    )
+
+                                    try:
+                                        evaluacion = (
+                                            auditor_ia.evaluar_proveedor(
+                                                perfil
+                                            )
+                                        )
+
+                                        if hasattr(
+                                            evaluacion, "model_dump"
+                                        ):
+                                            evaluacion_db = (
+                                                evaluacion.model_dump()
+                                            )
+                                        elif hasattr(evaluacion, "dict"):
+                                            evaluacion_db = evaluacion.dict()
+                                        else:
+                                            evaluacion_db = evaluacion
+
+                                        guardar_resultado_ia(
+                                            evaluacion_id,
+                                            evaluacion_db,
+                                        )
+
+                                        finalizar_intento_gemini(
+                                            intento_id=intento_id,
+                                            estado="EXITOSO",
+                                        )
+
+                                        dictamen = generar_dictamen(
+                                            perfil,
+                                            evaluacion,
+                                        )
+
+                                        actualizar_dictamen(
+                                            auditoria_id=auditoria_id,
+                                            dictamen=dictamen.get(
+                                                "dictamen"
+                                            ),
+                                            nivel_riesgo=str(
+                                                dictamen.get(
+                                                    "nivel_riesgo",
+                                                    "No determinado",
+                                                )
+                                            ).upper(),
+                                            puntaje_confianza=int(
+                                                dictamen.get(
+                                                    "puntaje_confianza",
+                                                    0,
+                                                )
+                                            ),
+                                            motivo=(
+                                                dictamen.get("motivo")
+                                                or evaluacion_db.get(
+                                                    "justificacion"
+                                                )
+                                            ),
+                                            observacion=(
+                                                "Auditoría masiva desde Excel."
+                                            ),
+                                            accion="EVALUACION",
+                                        )
+
+                                    except Exception as error_gemini:
+                                        finalizar_intento_gemini(
+                                            intento_id=intento_id,
+                                            estado="ERROR",
+                                            codigo_error="GEMINI_ERROR",
+                                            detalle_error=str(error_gemini),
+                                        )
+
+                                        registrar_error_ia(
+                                            evaluacion_id,
+                                            str(error_gemini),
+                                        )
+
+                                        raise
+
+                                # Guardar resultado para la interfaz
+                                resultados_lote.append({
+                                    "Fila Excel": fila_excel,
+                                    "RUC": ruc_actual,
+                                    "Razón social": perfil.get("razon_social"),
+                                    "Estado tributario": perfil.get("estado"),
+                                    "Condición": perfil.get("condicion"),
+                                    "Actividad económica": perfil.get(
+                                        "actividad_economica"
+                                    ),
+                                    "Servicio cotizado": servicio_actual,
+                                    "Monto": monto_actual,
+                                    "Moneda": moneda_actual,
+                                    "Coherencia comercial": evaluacion.get(
+                                        "coherencia_comercial"
+                                    ),
+                                    "Riesgo IA": evaluacion.get(
+                                        "nivel_riesgo"
+                                    ),
+                                    "Recomendación IA": evaluacion.get(
+                                        "recomendacion"
+                                    ),
+                                    "Confianza IA": dictamen.get(
+                                        "puntaje_confianza",
+                                        evaluacion.get(
+                                            "puntaje_confianza", 0
+                                        ),
+                                    ),
+                                    "Dictamen final": dictamen.get(
+                                        "dictamen"
+                                    ),
+                                    "Riesgo final": dictamen.get(
+                                        "nivel_riesgo"
+                                    ),
+                                    "Motivo": dictamen.get("motivo"),
+                                    "Alertas": " | ".join(
+                                        dictamen.get("alertas", [])
+                                    ),
+                                    "Error de proceso": (
+                                        dictamen.get("motivo")
+                                        if dictamen.get("dictamen")
+                                        == "PENDIENTE_VALIDACION"
+                                        else ""
+                                    ),
+                                })
+
+                                st.session_state.historial.append({
+                                    "fecha": datetime.now().strftime(
+                                        "%d/%m/%Y %H:%M:%S"
+                                    ),
+                                    "ruc": ruc_actual,
+                                    "razon_social": perfil.get(
+                                        "razon_social"
+                                    ),
+                                    "servicio": servicio_actual,
+                                    "monto": monto_actual,
+                                    "moneda": moneda_actual,
+                                    "dictamen": dictamen.get("dictamen"),
+                                    "nivel_riesgo": dictamen.get(
+                                        "nivel_riesgo"
+                                    ),
+                                    "puntaje_confianza": dictamen.get(
+                                        "puntaje_confianza", 0
+                                    ),
+                                })
+
+                            except Exception as error:
+                                errores_lote += 1
+
+                                resultados_lote.append({
+                                    "Fila Excel": fila_excel,
+                                    "RUC": ruc_actual,
+                                    "Razón social": "",
+                                    "Estado tributario": "",
+                                    "Condición": "",
+                                    "Actividad económica": "",
+                                    "Servicio cotizado": servicio_actual,
+                                    "Monto": monto_actual,
+                                    "Moneda": moneda_actual,
+                                    "Coherencia comercial": "",
+                                    "Riesgo IA": "No evaluado",
+                                    "Recomendación IA": "Revisar",
+                                    "Confianza IA": 0,
+                                    "Dictamen final": "PENDIENTE_VALIDACION",
+                                    "Riesgo final": "No determinado",
+                                    "Motivo": (
+                                        "No se pudo completar la auditoría "
+                                        "de este registro."
+                                    ),
+                                    "Alertas": "",
+                                    "Error de proceso": str(error),
+                                })
+
+                            barra.progress(
+                                posicion / len(df_validos)
+                            )
+
+                        # 4. Guardar resultados y referencias para reprocesar
+                        st.session_state[
+                            "resultados_auditoria_masiva"
+                        ] = resultados_lote
+
+                        st.session_state[
+                            "invalidos_auditoria_masiva"
+                        ] = df_invalidos.to_dict("records")
+
+                        st.session_state.perfiles_auditoria_masiva = (
+                            perfiles_por_registro
+                        )
+
+                        st.session_state[
+                            "auditorias_masivas_db"
+                        ] = auditorias_por_registro
+
+                        # 5. Finalizar lote
+                        estado_final = (
+                            "COMPLETADO_CON_ERRORES"
+                            if errores_lote > 0
+                            else "COMPLETADO"
+                        )
+
+                        actualizar_estado_lote(
+                            lote_id,
+                            estado_final,
+                        )
+
+                        texto_progreso.success(
+                            f"Lote N.º {lote_id} finalizado: "
+                            f"{len(resultados_lote)} registros procesados."
+                        )
+
+                    except Exception as error_lote:
+                        actualizar_estado_lote(lote_id, "ERROR")
+                        st.error(
+                            f"No se pudo completar el lote N.º "
+                            f"{lote_id}: {error_lote}"
+                        )
+
 
             # Mostrar y exportar el último lote procesado mientras el archivo siga cargado.
             resultados_guardados = st.session_state.get("resultados_auditoria_masiva", [])
@@ -1191,6 +1921,319 @@ elif pagina_actual == "Auditoría masiva":
                 r4.metric("Rechazados / pendientes", rechazados_lote + pendientes_lote)
 
                 st.dataframe(df_resultados, use_container_width=True, hide_index=True)
+
+                # ------------------------------------------------
+                # REPROCESAMIENTO DE AUDITORÍAS PENDIENTES
+                # ------------------------------------------------
+                st.markdown("#### 04 · Reprocesar auditorías pendientes")
+
+                perfiles_guardados = st.session_state.get(
+                    "perfiles_auditoria_masiva", {}
+                )
+
+
+                auditorias_db = st.session_state.get(
+                    "auditorias_masivas_db", {}
+                )
+
+                pendientes_reintentables = []
+
+                for registro in resultados_guardados:
+                    if registro.get("Dictamen final") != "PENDIENTE_VALIDACION":
+                        continue
+
+                    clave = (
+                        f"{registro.get('Fila Excel')}|{registro.get('RUC')}"
+                    )
+
+                    perfil_guardado = perfiles_guardados.get(clave, {})
+                    referencias_db = auditorias_db.get(clave, {})
+
+                    if (
+                        clave in perfiles_guardados
+                        and referencias_db.get("auditoria_id")
+                        and perfil_guardado.get("consulta_tributaria_exitosa")
+                    ):
+                        pendientes_reintentables.append(clave)
+
+
+                if pendientes_reintentables:
+                    st.info(
+                        "Puedes volver a ejecutar Gemini para estos registros. "
+                        "Se reutilizará el perfil tributario guardado y no se "
+                        "consultarán nuevamente OpenRUC ni Decolecta."
+                    )
+
+                    seleccionados = st.multiselect(
+                        "Selecciona los registros que deseas reprocesar",
+                        options=pendientes_reintentables,
+                        format_func=lambda clave: (
+                            f"Fila {clave.split('|')[0]} · RUC {clave.split('|')[1]}"
+                        ),
+                        key="seleccion_pendientes_reintento",
+                    )
+
+                    if st.button(
+                        "↻ Reprocesar seleccionados",
+                        type="primary",
+                        disabled=not seleccionados,
+                        use_container_width=True,
+                        key="reprocesar_pendientes",
+                    ):
+                        progreso_reintento = st.progress(0)
+                        estado_reintento = st.empty()
+
+                        for indice, clave in enumerate(seleccionados, start=1):
+                            fila_excel, ruc_reintento = clave.split("|", 1)
+                            perfil_reintento = perfiles_guardados[clave].copy()
+
+                            estado_reintento.write(
+                                f"Reprocesando fila {fila_excel} · RUC {ruc_reintento}"
+                            )
+
+
+                            try:
+                                referencias = auditorias_db.get(clave)
+
+                                if not referencias:
+                                    raise RuntimeError(
+                                        "No se encontraron los identificadores "
+                                        "de la auditoría en MySQL."
+                                    )
+
+                                auditoria_id = referencias["auditoria_id"]
+
+                                # Crear una nueva evaluación asociada
+                                # a la misma auditoría.
+                                modelo_gemini = os.getenv(
+                                    "GEMINI_MODEL",
+                                    "gemini-4-hydrogen",
+                                )
+
+                                nueva_evaluacion_id = crear_evaluacion_ia(
+                                    auditoria_id,
+                                    modelo_gemini,
+                                )
+
+                                intento_id = registrar_intento_gemini(
+                                    evaluacion_id=nueva_evaluacion_id,
+                                    numero_intento=1,
+                                    estado="EN_PROCESO",
+                                )
+
+                                try:
+                                    evaluacion_reintento = (
+                                        auditor_ia.evaluar_proveedor(
+                                            perfil_reintento
+                                        )
+                                    )
+
+                                    if hasattr(
+                                        evaluacion_reintento,
+                                        "model_dump",
+                                    ):
+                                        evaluacion_db = (
+                                            evaluacion_reintento.model_dump()
+                                        )
+                                    elif hasattr(
+                                        evaluacion_reintento,
+                                        "dict",
+                                    ):
+                                        evaluacion_db = (
+                                            evaluacion_reintento.dict()
+                                        )
+                                    else:
+                                        evaluacion_db = evaluacion_reintento
+
+                                    guardar_resultado_ia(
+                                        nueva_evaluacion_id,
+                                        evaluacion_db,
+                                    )
+
+                                    finalizar_intento_gemini(
+                                        intento_id=intento_id,
+                                        estado="EXITOSO",
+                                    )
+
+                                except Exception as error_gemini:
+                                    finalizar_intento_gemini(
+                                        intento_id=intento_id,
+                                        estado="ERROR",
+                                        codigo_error="GEMINI_ERROR",
+                                        detalle_error=str(error_gemini),
+                                    )
+
+                                    registrar_error_ia(
+                                        nueva_evaluacion_id,
+                                        str(error_gemini),
+                                    )
+
+                                    raise
+
+                                dictamen_reintento = generar_dictamen(
+                                    perfil_reintento,
+                                    evaluacion_reintento,
+                                )
+
+                                # Actualizar el dictamen de la misma
+                                # auditoría y registrar el reprocesamiento.
+                                actualizar_dictamen(
+                                    auditoria_id=auditoria_id,
+                                    dictamen=dictamen_reintento.get(
+                                        "dictamen"
+                                    ),
+                                    nivel_riesgo=str(
+                                        dictamen_reintento.get(
+                                            "nivel_riesgo",
+                                            "No determinado",
+                                        )
+                                    ).upper(),
+                                    puntaje_confianza=int(
+                                        dictamen_reintento.get(
+                                            "puntaje_confianza",
+                                            0,
+                                        )
+                                    ),
+                                    motivo=(
+                                        dictamen_reintento.get("motivo")
+                                        or evaluacion_db.get("justificacion")
+                                    ),
+                                    observacion=(
+                                        "Reprocesamiento de auditoría "
+                                        "masiva mediante Gemini."
+                                    ),
+                                    accion="REPROCESAMIENTO",
+                                )
+
+                                # Actualizar la referencia a la evaluación
+                                # más reciente, manteniendo la auditoría.
+                                auditorias_db[clave][
+                                    "evaluacion_id"
+                                ] = nueva_evaluacion_id
+
+                                for registro in resultados_guardados:
+                                    if (
+                                        str(registro.get("Fila Excel"))
+                                        == fila_excel
+                                        and str(registro.get("RUC"))
+                                        == ruc_reintento
+                                    ):
+                                        registro.update({
+                                            "Razón social": perfil_reintento.get(
+                                                "razon_social"
+                                            ),
+                                            "Estado tributario": perfil_reintento.get(
+                                                "estado"
+                                            ),
+                                            "Condición": perfil_reintento.get(
+                                                "condicion"
+                                            ),
+                                            "Actividad económica": perfil_reintento.get(
+                                                "actividad_economica"
+                                            ),
+                                            "Coherencia comercial": (
+                                                evaluacion_db.get(
+                                                    "coherencia_comercial"
+                                                )
+                                            ),
+                                            "Riesgo IA": evaluacion_db.get(
+                                                "nivel_riesgo"
+                                            ),
+                                            "Recomendación IA": evaluacion_db.get(
+                                                "recomendacion"
+                                            ),
+                                            "Confianza IA": dictamen_reintento.get(
+                                                "puntaje_confianza",
+                                                evaluacion_db.get(
+                                                    "puntaje_confianza", 0
+                                                ),
+                                            ),
+                                            "Dictamen final": (
+                                                dictamen_reintento.get(
+                                                    "dictamen"
+                                                )
+                                            ),
+                                            "Riesgo final": (
+                                                dictamen_reintento.get(
+                                                    "nivel_riesgo"
+                                                )
+                                            ),
+                                            "Motivo": dictamen_reintento.get(
+                                                "motivo"
+                                            ),
+                                            "Alertas": " | ".join(
+                                                dictamen_reintento.get(
+                                                    "alertas", []
+                                                )
+                                            ),
+                                            "Error de proceso": "",
+                                        })
+                                        break
+
+                            except Exception as error:
+                                for registro in resultados_guardados:
+                                    if (
+                                        str(registro.get("Fila Excel"))
+                                        == fila_excel
+                                        and str(registro.get("RUC"))
+                                        == ruc_reintento
+                                    ):
+                                        registro["Error de proceso"] = str(
+                                            error
+                                        )
+                                        break
+
+                                # Actualizar el historial existente o agregarlo si no existía.
+                                coincidencias = [
+                                    item for item in st.session_state.historial
+                                    if (
+                                        str(item.get("ruc")) == ruc_reintento
+                                        and str(item.get("servicio")) == str(perfil_reintento.get("servicio_cotizado"))
+                                        and float(item.get("monto", 0) or 0) == float(perfil_reintento.get("monto", 0) or 0)
+                                    )
+                                ]
+
+                                datos_historial = {
+                                    "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+                                    "ruc": ruc_reintento,
+                                    "razon_social": perfil_reintento.get("razon_social"),
+                                    "servicio": perfil_reintento.get("servicio_cotizado"),
+                                    "monto": perfil_reintento.get("monto"),
+                                    "moneda": perfil_reintento.get("moneda"),
+                                    "dictamen": dictamen_reintento.get("dictamen"),
+                                    "nivel_riesgo": dictamen_reintento.get("nivel_riesgo"),
+                                    "puntaje_confianza": dictamen_reintento.get("puntaje_confianza", 0),
+                                }
+
+                                if coincidencias:
+                                    coincidencias[-1].update(datos_historial)
+                                else:
+                                    st.session_state.historial.append(datos_historial)
+
+                            except Exception as error:
+                                for registro in resultados_guardados:
+                                    if (
+                                        str(registro.get("Fila Excel")) == fila_excel
+                                        and str(registro.get("RUC")) == ruc_reintento
+                                    ):
+                                        registro["Error de proceso"] = str(error)
+                                        break
+
+                            progreso_reintento.progress(
+                                indice / len(seleccionados)
+                            )
+
+                        st.session_state["resultados_auditoria_masiva"] = resultados_guardados
+                        st.session_state["auditorias_masivas_db"] = auditorias_db
+                        estado_reintento.success("Reprocesamiento finalizado.")
+                        st.rerun()
+
+                else:
+                    st.caption(
+                        "No hay auditorías pendientes con perfil tributario disponible "
+                        "para reprocesar. Los registros sin perfil guardado requieren "
+                        "una nueva consulta empresarial."
+                    )
 
                 invalidos_guardados = st.session_state.get("invalidos_auditoria_masiva", [])
                 invalidos_exportables = []
@@ -1222,11 +2265,15 @@ elif pagina_actual == "Historial":
 
     mostrar_encabezado(
         "Historial de auditorías",
-        "Consulta, filtra y exporta los resultados generados durante esta sesión.",
+        "Consulta, filtra y exporta todos los resultados almacenados en MySQL.",
         "REGISTRO DE ACTIVIDAD",
     )
 
-    historial = st.session_state.historial
+    try:
+        historial = obtener_historial_desde_db()
+    except Exception as error:
+        st.error(f"No se pudo recuperar el historial desde MySQL: {error}")
+        historial = []
 
     if not historial:
         st.info("Todavía no se han ejecutado auditorías en esta sesión.")
@@ -1305,16 +2352,308 @@ elif pagina_actual == "Historial":
                 use_container_width=True,
             )
 
-        st.markdown("---")
 
-        confirmar_limpieza = st.checkbox(
-            "Confirmo que deseo limpiar el historial de esta sesión."
+        # --------------------------------------------------------
+        # DETALLE DE AUDITORÍA
+        # --------------------------------------------------------
+
+        st.markdown("---")
+        st.markdown("### Consultar detalle de auditoría")
+        st.caption(
+            "Selecciona una auditoría para consultar su información "
+            "empresarial, evaluación de Gemini y trazabilidad."
         )
 
-        if st.button(
-            "Limpiar historial",
-            disabled=not confirmar_limpieza,
-        ):
-            st.session_state.historial = []
-            st.session_state.ultimo_resultado = None
-            st.rerun()
+        if not filtrado.empty:
+
+            opciones_auditorias = {
+                int(fila["auditoria_id"]): (
+                    f'ID {fila["auditoria_id"]} · '
+                    f'{fila["razon_social"]} · '
+                    f'{fila["ruc"]} · '
+                    f'{fila["dictamen"]}'
+                )
+                for _, fila in filtrado.iterrows()
+                if pd.notna(fila.get("auditoria_id"))
+            }
+
+            if opciones_auditorias:
+
+                auditoria_seleccionada = st.selectbox(
+                    "Selecciona la auditoría",
+                    options=list(opciones_auditorias.keys()),
+                    format_func=lambda auditoria_id: (
+                        opciones_auditorias[auditoria_id]
+                    ),
+                    key="auditoria_detalle_seleccionada",
+                )
+
+                if st.button(
+                    "Consultar detalle",
+                    type="primary",
+                    use_container_width=True,
+                    key="consultar_detalle_auditoria",
+                ):
+                    st.session_state["mostrar_detalle_auditoria"] = True
+
+                if st.session_state.get("mostrar_detalle_auditoria"):
+
+                    auditoria_id = auditoria_seleccionada
+
+                    try:
+                        auditoria = obtener_auditoria(auditoria_id)
+
+                        if not auditoria:
+                            st.warning(
+                                "No se encontró la auditoría seleccionada."
+                            )
+                        else:
+                            evaluaciones = listar_evaluaciones(auditoria_id)
+                            historial_cambios = listar_historial(auditoria_id)
+
+                            st.markdown("---")
+                            st.markdown(
+                                f"## Auditoría N.º {auditoria_id}"
+                            )
+
+                            # Información general
+                            st.markdown("#### 01 · Información general")
+
+                            g1, g2, g3, g4 = st.columns(4)
+
+                            g1.metric(
+                                "Dictamen",
+                                auditoria.get("dictamen") or "N/D",
+                            )
+                            g2.metric(
+                                "Riesgo",
+                                auditoria.get("nivel_riesgo") or "N/D",
+                            )
+                            g3.metric(
+                                "Confianza",
+                                f'{auditoria.get("puntaje_confianza", 0)}/100',
+                            )
+                            g4.metric(
+                                "Estado",
+                                auditoria.get("estado") or "N/D",
+                            )
+
+                            # Información del proveedor y cotización
+                            st.markdown("#### 02 · Proveedor y cotización")
+
+                            datos_auditoria = {
+                                "RUC": auditoria.get("ruc"),
+                                "Razón social": auditoria.get("razon_social"),
+                                "Servicio cotizado": auditoria.get(
+                                    "servicio_cotizado"
+                                ),
+                                "Monto": formato_moneda(
+                                    auditoria.get("monto") or 0,
+                                    auditoria.get("moneda") or "PEN",
+                                ),
+                                "Motivo del dictamen": auditoria.get("motivo"),
+                                "Fecha de creación": auditoria.get("creada_en"),
+                                "Última actualización": auditoria.get(
+                                    "actualizada_en"
+                                ),
+                            }
+
+                            df_datos = pd.DataFrame(
+                                [
+                                    {
+                                        "Campo": campo,
+                                        "Información": (
+                                            str(valor)
+                                            if valor is not None
+                                            else "No disponible"
+                                        ),
+                                    }
+                                    for campo, valor in datos_auditoria.items()
+                                ]
+                            )
+
+                            st.dataframe(
+                                df_datos,
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+                            # Evaluaciones de Gemini
+                            st.markdown("#### 03 · Evaluaciones de Gemini")
+
+                            if evaluaciones:
+
+                                for numero, evaluacion in enumerate(
+                                    evaluaciones,
+                                    start=1,
+                                ):
+                                    with st.expander(
+                                        f'Evaluación {numero} · '
+                                        f'{evaluacion.get("estado", "N/D")} · '
+                                        f'{evaluacion.get("modelo", "Modelo no disponible")}',
+                                        expanded=(numero == 1),
+                                    ):
+                                        e1, e2, e3 = st.columns(3)
+
+                                        e1.metric(
+                                            "Coherencia",
+                                            evaluacion.get(
+                                                "coherencia_comercial"
+                                            ) or "N/D",
+                                        )
+                                        e2.metric(
+                                            "Riesgo IA",
+                                            evaluacion.get(
+                                                "nivel_riesgo"
+                                            ) or "N/D",
+                                        )
+                                        e3.metric(
+                                            "Confianza IA",
+                                            f'{evaluacion.get("puntaje_confianza") or 0}/100',
+                                        )
+
+                                        st.markdown("**Recomendación**")
+                                        st.write(
+                                            evaluacion.get("recomendacion")
+                                            or "No disponible"
+                                        )
+
+                                        st.markdown("**Justificación**")
+                                        st.write(
+                                            evaluacion.get("justificacion")
+                                            or "No disponible"
+                                        )
+
+                                        alertas = convertir_json(
+                                            evaluacion.get("alertas"),
+                                            [],
+                                        )
+
+                                        st.markdown("**Alertas identificadas**")
+
+                                        if alertas:
+                                            for alerta in alertas:
+                                                st.warning(str(alerta))
+                                        else:
+                                            st.success(
+                                                "No se registraron alertas."
+                                            )
+
+                                        if evaluacion.get("error"):
+                                            st.error(
+                                                f'Error registrado: '
+                                                f'{evaluacion["error"]}'
+                                            )
+
+                                        # Respuesta completa de Gemini
+                                        respuesta = convertir_json(
+                                            evaluacion.get("respuesta"),
+                                            {},
+                                        )
+
+                                        if respuesta:
+                                            with st.expander(
+                                                "Ver respuesta completa de Gemini"
+                                            ):
+                                                st.json(respuesta)
+
+                                        # Intentos de comunicación
+                                        intentos = listar_intentos(
+                                            evaluacion["id"]
+                                        )
+
+                                        st.markdown("**Intentos de Gemini**")
+
+                                        if intentos:
+                                            df_intentos = pd.DataFrame(
+                                                [
+                                                    {
+                                                        "N.º intento": intento.get(
+                                                            "numero_intento"
+                                                        ),
+                                                        "Estado": intento.get(
+                                                            "estado"
+                                                        ),
+                                                        "Código de error": intento.get(
+                                                            "codigo_error"
+                                                        ),
+                                                        "Detalle": intento.get(
+                                                            "detalle_error"
+                                                        ),
+                                                        "Inicio": intento.get(
+                                                            "iniciado_en"
+                                                        ),
+                                                        "Finalización": intento.get(
+                                                            "finalizado_en"
+                                                        ),
+                                                    }
+                                                    for intento in intentos
+                                                ]
+                                            )
+
+                                            st.dataframe(
+                                                df_intentos,
+                                                use_container_width=True,
+                                                hide_index=True,
+                                            )
+                                        else:
+                                            st.caption(
+                                                "No hay intentos registrados."
+                                            )
+
+                            else:
+                                st.info(
+                                    "Esta auditoría todavía no tiene "
+                                    "evaluaciones de Gemini registradas."
+                                )
+
+                            # Historial de cambios
+                            st.markdown("#### 04 · Historial de cambios")
+
+                            if historial_cambios:
+
+                                df_cambios = pd.DataFrame(
+                                    [
+                                        {
+                                            "Fecha": cambio.get("creado_en"),
+                                            "Dictamen anterior": cambio.get(
+                                                "dictamen_anterior"
+                                            ),
+                                            "Dictamen nuevo": cambio.get(
+                                                "dictamen_nuevo"
+                                            ),
+                                            "Acción": cambio.get("accion"),
+                                            "Observación": cambio.get(
+                                                "observacion"
+                                            ),
+                                        }
+                                        for cambio in historial_cambios
+                                    ]
+                                )
+
+                                st.dataframe(
+                                    df_cambios,
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                            else:
+                                st.info(
+                                    "No existen cambios registrados "
+                                    "para esta auditoría."
+                                )
+
+                    except Exception as error:
+                        st.error(
+                            f"No se pudo consultar el detalle: {error}"
+                        )
+
+            else:
+                st.info(
+                    "No hay identificadores de auditoría disponibles "
+                    "en los resultados filtrados."
+                )
+        else:
+            st.info(
+                "No hay resultados que permitan consultar un detalle."
+            )

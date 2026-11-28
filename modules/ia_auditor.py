@@ -1,6 +1,7 @@
 
 import json
 import os
+import time
 from typing import Literal
 
 from google.genai import errors
@@ -169,37 +170,57 @@ class AuditorIA:
 
         esquema = ResultadoAuditoria.model_json_schema()
 
-        try:
-            respuesta = self.client.models.generate_content(
-                model=MODEL,
-                contents=[
-                    system_prompt,
-                    user_prompt
-                ],
-                config={
-                    "response_mime_type": "application/json",
-                    "response_json_schema": esquema
-                }
-            )
 
-        except errors.APIError as error:
+        max_intentos = 3
+        respuesta = None
 
-            if error.code == 503:
-                raise RuntimeError(
-                    "Gemini está temporalmente sobrecargado. "
-                    "Intenta nuevamente en unos minutos."
-                ) from error
+        for intento in range(1, max_intentos + 1):
+            try:
+                respuesta = self.client.models.generate_content(
+                    model=MODEL,
+                    contents=[
+                        system_prompt,
+                        user_prompt
+                    ],
+                    config={
+                        "response_mime_type": "application/json",
+                        "response_json_schema": esquema
+                    }
+                )
 
-            elif error.code == 429:
-                raise RuntimeError(
-                    "Se alcanzó un límite de solicitudes de Gemini. "
-                    "Revisa tu cuota gratuita."
-                ) from error
+                break
 
-            else:
-                raise RuntimeError(
-                    f"Error en Gemini API: {error}"
-                ) from error
+            except errors.APIError as error:
+
+                if error.code == 503:
+                    if intento < max_intentos:
+                        espera = 2 ** intento
+
+                        print(
+                            f"Gemini sobrecargado. "
+                            f"Reintento {intento}/{max_intentos - 1} "
+                            f"en {espera} segundos..."
+                        )
+
+                        time.sleep(espera)
+                        continue
+
+                    raise RuntimeError(
+                        "Gemini continúa temporalmente sobrecargado "
+                        "después de 3 intentos."
+                    ) from error
+
+                elif error.code == 429:
+                    raise RuntimeError(
+                        "Se alcanzó un límite de solicitudes de Gemini. "
+                        "Revisa tu cuota gratuita."
+                    ) from error
+
+                else:
+                    raise RuntimeError(
+                        f"Error en Gemini API: {error}"
+                    ) from error
+
 
         contenido = respuesta.text
 
